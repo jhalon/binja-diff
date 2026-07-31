@@ -1,0 +1,11 @@
+# QBinDiff provides the function matching engine.
+#
+# It pulls in numpy, scipy, scikit-learn, networkx, capstone, datasketch,
+# lapjv-numpy2, python-bindiff and python-binexport, and ships three compiled
+# Cython/OpenMP extensions. Prebuilt wheels exist for CPython 3.10-3.12 on
+# manylinux/musllinux (x86_64, i686) only; anywhere else pip falls back to a
+# source build needing meson>=1.1, cython, a C++ compiler and numpy>=2 headers.
+#
+# Installing this into a dedicated virtualenv rather than Binary Ninja's
+# bundled interpreter avoids numpy/scipy version skew. See README.md.
+qbindiff>=1.2.3

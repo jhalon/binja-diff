@@ -1,0 +1,31 @@
+# Type checking with ty (https://docs.astral.sh/ty/).
+
+[environment]
+python-version = "3.10"
+
+[src]
+# Read-only upstream checkouts. They are here to be read, not type-checked.
+exclude = [
+    "qbindiff",
+    "quokka",
+    "binaryninja-api",
+    "sep-binja",
+]
+
+[rules]
+# Nothing this plugin imports resolves from a bare checkout, and that is not a
+# problem to fix:
+#
+#   * binaryninja, binaryninjaui and Binary Ninja's PySide6 build live inside
+#     the application bundle and are only importable from its interpreter;
+#   * qbindiff is deliberately installed in a separate virtualenv (see README);
+#   * the relative imports (``from ..core import ...``) resolve only when the
+#     checkout is installed as a plugin directory. Its own name contains a
+#     hyphen, so it cannot be a module here — the test bootstrap loads it by
+#     path for exactly this reason.
+#
+# Leaving this as an error would mean a pre-commit hook that fails on every
+# machine, every time. Everything ty can still check without those symbols is
+# checked.
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"

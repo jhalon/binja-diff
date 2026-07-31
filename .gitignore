@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Binary Ninja imports the plugin under several interpreters over a session, so
+# these accumulate one set per Python minor version.
+*.pyo
+
+# Tool caches.
+.ruff_cache/
+.ty_cache/
+
+# The QBinDiff virtualenv the tests run under. Built locally, never committed;
+# it has to match the Python version Binary Ninja itself runs.
+.venv*/
+
+.DS_Store
+*.json

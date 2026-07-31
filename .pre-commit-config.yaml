@@ -1,0 +1,25 @@
+# Install with:  pre-commit install
+# Run over everything once:  pre-commit run --all-files
+#
+# Both tools read their own config from the repo root (ruff.toml, ty.toml),
+# which is also what a bare `ruff check .` or `ty check` picks up — the hooks
+# and running them by hand cannot disagree.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      # --force-exclude is in the hook's own entry, which is what makes the
+      # vendored trees stay excluded even though pre-commit passes explicit
+      # filenames.
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/astral-sh/ty-pre-commit
+    rev: v0.0.65
+    hooks:
+      # Checks the whole project rather than the staged files: deleting a
+      # symbol in one module produces diagnostics in another, so a hook that
+      # only looked at what changed would pass on the commit that broke it.
+      - id: ty

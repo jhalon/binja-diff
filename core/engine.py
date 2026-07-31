@@ -1,0 +1,877 @@
+# Copyright 2026
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Driving QBinDiff from inside Binary Ninja.
+
+Everything here runs off the UI thread. The only contract with the UI is the
+``on_done`` / ``on_error`` callbacks, which are marshalled back to the main
+thread by the caller.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING
+from collections.abc import Callable
+
+import binaryninja
+from binaryninja import BinaryView, BackgroundTaskThread
+from binaryninja import log_debug, log_error, log_info, log_warn
+from binaryninja.enums import AnalysisState
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from qbindiff import Mapping
+    from qbindiff.loader import Function as QBFunction, Program as QBProgram
+    from qbindiff.types import Addr, Idx, SimMatrix
+
+
+#: Structural feature keys registered on top of QBinDiff's own defaults.
+#: The stock defaults (FuncName, Address, DatName, Constant) carry almost no
+#: signal on a stripped binary at a different base address: names are gone,
+#: addresses moved, and only data references and constants remain. These six
+#: describe the code itself — mnemonic histograms, CFG size and complexity,
+#: call-graph fan-in/out — and are cheap to extract.
+DEFAULT_EXTRA_FEATURES = ("M", "Mt", "bnb", "cc", "cnb", "pnb")
+
+#: Feature keys offered in the UI beyond what run_diff registers by default.
+#: spp and Gmd largely repeat what M and bnb/cc already measure, so they stay
+#: opt-in rather than diluting the default weighting.
+EXTRA_FEATURE_KEYS = ("spp", "Gmd", "jnb", "Gp")
+
+#: Auto-generated name shapes (Binary Ninja's ``sub_401000``, IDA's
+#: ``FUN_00401000``). Deliberately a superset of the filter QBinDiff's FuncName
+#: feature applies: an address-shaped name is refused as an anchor even when
+#: the digits differ from the function's own address, because two builds that
+#: auto-name a function identically only prove their code sits at the same
+#: offset — precisely the assumption that breaks when code is inserted.
+_AUTO_NAME_RE = re.compile(r"^(sub|fun)_[0-9a-f]+$", re.IGNORECASE)
+
+
+def is_generated_name(name: str) -> bool:
+    """Whether a function name is Binary Ninja's placeholder rather than a symbol.
+
+    Also what `core.symbols` uses to decide there is nothing worth porting, and
+    that a target name may be overwritten without asking.
+    """
+
+    return bool(_AUTO_NAME_RE.match(name))
+
+
+def _anchor_names(program: QBProgram) -> dict[str, Addr]:
+    """Function names trustworthy enough to anchor a match: real (not
+    auto-generated), unique within the program, and not an import, which
+    QBinDiff's built-in prepass already anchors."""
+
+    names: dict[str, Addr] = {}
+    duplicated: set[str] = set()
+    for addr, func in program.items():
+        if func.is_import() or is_generated_name(func.name):
+            continue
+        if func.name in names:
+            duplicated.add(func.name)
+        names[func.name] = addr
+    for name in duplicated:
+        del names[name]
+    return names
+
+
+def match_named_functions(
+    sim_matrix: SimMatrix,
+    primary: QBProgram,
+    secondary: QBProgram,
+    primary_mapping: dict[Addr, Idx],
+    secondary_mapping: dict[Addr, Idx],
+    primary_features: dict | None = None,
+    secondary_features: dict | None = None,
+) -> None:
+    """Postpass anchoring functions that carry the same real symbol name.
+
+    QBinDiff only anchors imports on its own; two non-import functions with
+    identical names merely share one feature vote among many. A symbol name —
+    from an unstripped binary, or a .bndb where the user renamed functions —
+    is stronger evidence than any feature, so pin those pairs outright and let
+    belief propagation spend its effort on the functions actually in doubt.
+
+    Deliberately a postpass, not a prepass. A prepass makes FeaturePass skip
+    the anchored rows, and when every function pair anchors — two fully
+    symboled builds of the same source — FeaturePass divides by the count of
+    rows it has left, which is zero (qbindiff 1.2.3, passes/base.py). It also
+    crashes before resetting the function filters it installed, so the error
+    is not recoverable from outside. Overwriting the computed similarities
+    afterwards costs one redundant feature extraction and has no edge cases.
+    """
+
+    secondary_names = _anchor_names(secondary)
+    pairs = [
+        (primary_mapping[addr], secondary_mapping[secondary_names[name]])
+        for name, addr in _anchor_names(primary).items()
+        if name in secondary_names
+    ]
+    if not pairs:
+        return
+    rows, cols = zip(*pairs, strict=True)
+    sim_matrix[rows, :] = 0
+    sim_matrix[:, cols] = 0
+    sim_matrix[rows, cols] = 1
+    log_info(f"Anchored {len(pairs)} function pair(s) by symbol name", "QBinDiff")
+
+
+class _BinjaLogHandler(logging.Handler):
+    """Forward qbindiff's root-logger output into the Binary Ninja log."""
+
+    _LEVELS = ((logging.ERROR, log_error), (logging.WARNING, log_warn), (logging.INFO, log_info))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+        except Exception:
+            return
+        for level, sink in self._LEVELS:
+            if record.levelno >= level:
+                sink(message, "QBinDiff")
+                return
+        log_debug(message, "QBinDiff")
+
+
+class _log_bridge:
+    """Route qbindiff's logging into the Binary Ninja log, and only there.
+
+    qbindiff logs through the module-level ``logging`` functions — the root
+    logger — so the handler has to go on root, and the root level has to come
+    down to INFO for anything to reach it.
+
+    That level change is also why every other root handler is muted for the
+    duration. Root normally sits at WARNING, so qbindiff's INFO records are
+    dropped before any handler sees them; lowering it lets them through to
+    *all* of them, including whichever one in the process writes to the
+    console. Binary Ninja mirrors that stream into its log, so each qbindiff
+    line arrived twice — once tagged QBinDiff, once as ``INFO:root:`` from the
+    scripting provider. Nothing is lost by muting: this handler forwards the
+    same records, at the same levels, and the originals are restored on exit.
+    """
+
+    def __init__(self, level: int = logging.INFO):
+        self._handler = _BinjaLogHandler()
+        self._handler.setFormatter(logging.Formatter("%(message)s"))
+        self._level = level
+        self._previous_level: int | None = None
+        self._muted: list[tuple[logging.Handler, int]] = []
+
+    def __enter__(self) -> None:
+        root = logging.getLogger()
+        self._previous_level = root.level
+        self._muted = [(handler, handler.level) for handler in root.handlers]
+        for handler, _level in self._muted:
+            handler.setLevel(logging.CRITICAL + 1)
+        root.setLevel(self._level)
+        root.addHandler(self._handler)
+
+    def __exit__(self, *_exc) -> None:
+        root = logging.getLogger()
+        root.removeHandler(self._handler)
+        for handler, level in self._muted:
+            handler.setLevel(level)
+        self._muted = []
+        if self._previous_level is not None:
+            root.setLevel(self._previous_level)
+
+
+@dataclass
+class DiffOptions:
+    """QBinDiff's matching parameters, in one place.
+
+    The defaults are what every diff runs with: the UI constructs this and
+    offers no way to change it, and the CLI exposes five of the nine as flags.
+    Anything that should be settable belongs here rather than at the call site,
+    so the two front ends cannot drift apart.
+    """
+
+    sparsity_ratio: float = 0.6
+    tradeoff: float = 0.8
+    epsilon: float = 0.9
+    maxiter: int = 1000
+    distance: str = "haussmann"
+    normalize: bool = False
+    sparse_row: bool = False
+    """Sparsify the similarity matrix row by row instead of globally. At high
+    sparsity a global cutoff can leave some functions with no candidate at all;
+    row-wise keeps the best candidates for every function."""
+    auto_sparsity: bool = True
+    """Raise sparsity automatically for large binaries (see LARGE_DIFF_*)."""
+    features: tuple[str, ...] = ()
+    """Extra feature keys on top of the default set (QBinDiff's own defaults plus
+    DEFAULT_EXTRA_FEATURES). Empty means defaults only."""
+
+
+#: QBinDiff's graph matching computes quadratically sized matrices; upstream
+#: advises against diffing programs beyond ~10k functions at the default
+#: sparsity and recommends 0.99 for large ones.
+LARGE_DIFF_FUNCTIONS = 10_000
+LARGE_DIFF_SPARSITY = 0.99
+
+
+def scale_options_for_size(
+    options: DiffOptions, primary_count: int, secondary_count: int
+) -> DiffOptions:
+    """Adapt the matching parameters to the size of the programs.
+
+    Above LARGE_DIFF_FUNCTIONS on either side, sparsity is raised to
+    LARGE_DIFF_SPARSITY and row-wise sparsification is enabled, following
+    upstream's guidance for large programs. This only tames the belief
+    propagation stage: the dense similarity matrix (4 bytes per function
+    pair) is allocated by QBinDiff before sparsification and no setting
+    avoids it, so the warning states that cost rather than pretending the
+    diff is now cheap.
+    """
+
+    largest = max(primary_count, secondary_count)
+    if not options.auto_sparsity or largest <= LARGE_DIFF_FUNCTIONS:
+        return options
+    dense_gib = primary_count * secondary_count * 4 / 1024**3
+    if options.sparsity_ratio >= LARGE_DIFF_SPARSITY:
+        log_warn(
+            f"Large diff ({primary_count} x {secondary_count} functions): the similarity "
+            f"matrix alone needs ~{dense_gib:.1f} GiB of RAM",
+            "QBinDiff",
+        )
+        return options
+    log_warn(
+        f"Large diff ({primary_count} x {secondary_count} functions): raising sparsity "
+        f"{options.sparsity_ratio} -> {LARGE_DIFF_SPARSITY} and enabling row-wise "
+        f"sparsification to contain matching memory. The similarity matrix alone still "
+        f"needs ~{dense_gib:.1f} GiB of RAM",
+        "QBinDiff",
+    )
+    return replace(options, sparsity_ratio=LARGE_DIFF_SPARSITY, sparse_row=True)
+
+
+#: Progress fraction meaning "this will take a while and nothing can say how
+#: long". The UI shows a busy indicator instead of a bar pinned at either end.
+INDETERMINATE = -1.0
+
+#: Where QBinDiff's feature phase stops being measurable. Its progress comes
+#: from the feature *visitor* alone: once every function has been visited, the
+#: same generator goes on to compute one full similarity matrix per registered
+#: feature, and yields nothing again until that is finished. The visitor's last
+#: step lands one function short of 1000 — within rounding of 1.0 for any
+#: program of a few hundred functions, and for anything smaller the stage it
+#: guards is instant anyway.
+EXTRACTION_DONE = 0.995
+
+
+def feature_phase(fraction: float) -> tuple[str, float]:
+    """What to display for a step of QBinDiff's feature phase.
+
+    Two stages hide behind one generator, and only the first can be measured.
+    Leaving the second one labelled "Extracting features" at 100% is what makes
+    a long diff look hung: the step it names finished minutes ago.
+    """
+
+    if fraction >= EXTRACTION_DONE:
+        return "Building the similarity matrix", INDETERMINATE
+    return "Extracting features", fraction
+
+
+def format_duration(seconds: float) -> str:
+    """A duration at the precision a human reading a log actually wants."""
+
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m {rest:02d}s"
+
+
+@contextmanager
+def _timed(timings: list[tuple[str, float]], label: str):
+    """Record and log how long a phase took.
+
+    Deliberately in a ``finally``: a cancelled or failed phase is exactly the
+    one worth knowing the duration of, and "matching ran for 40 minutes before
+    I gave up" is the number that tells you to raise the sparsity.
+    """
+
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        timings.append((label, elapsed))
+        log_info(f"{label} took {format_duration(elapsed)}", "QBinDiff")
+
+
+@dataclass(frozen=True)
+class FunctionRef:
+    """One side of a match, reduced to what the UI actually reads back."""
+
+    addr: int
+    name: str
+
+
+@dataclass(frozen=True)
+class MatchRecord:
+    primary: FunctionRef
+    secondary: FunctionRef
+    similarity: float
+    confidence: float
+
+
+@dataclass
+class DiffResult:
+    """A completed diff, indexed for the UI.
+
+    Deliberately holds plain records rather than QBinDiff's ``Mapping``. The
+    ``Match`` objects there point back at the two ``Program`` graphs, which
+    carry every feature vector extracted during the diff — tens of megabytes
+    kept alive for the lifetime of the view, to expose an address and a name.
+    Copying the few fields the UI needs also makes a result serializable, which
+    is what ``core.persist`` saves and restores.
+    """
+
+    primary_bv: BinaryView
+    secondary_bv: BinaryView
+    similarity: float
+    matches: list[MatchRecord] = field(default_factory=list)
+    primary_unmatched: list[FunctionRef] = field(default_factory=list)
+    secondary_unmatched: list[FunctionRef] = field(default_factory=list)
+    #: Wall-clock seconds per phase, in the order they ran. Describes the run
+    #: that produced this result, so a restored diff carries only its own load.
+    timings: list[tuple[str, float]] = field(default_factory=list)
+    #: Address lookups for the table and for navigation. Mapping's own
+    #: match_primary/match_secondary are linear scans, far too slow for a
+    #: table that queries per row.
+    by_primary: dict[int, MatchRecord] = field(init=False, default_factory=dict)
+    by_secondary: dict[int, MatchRecord] = field(init=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.reindex()
+
+    def reindex(self) -> None:
+        """Rebuild the address lookups. Call after replacing ``matches``."""
+
+        self.by_primary = {m.primary.addr: m for m in self.matches}
+        self.by_secondary = {m.secondary.addr: m for m in self.matches}
+
+    @classmethod
+    def build(cls, primary_bv, secondary_bv, mapping: Mapping) -> DiffResult:
+        return cls(
+            primary_bv=primary_bv,
+            secondary_bv=secondary_bv,
+            similarity=float(mapping.normalized_similarity),
+            matches=[
+                MatchRecord(
+                    primary=FunctionRef(m.primary.addr, m.primary.name),
+                    secondary=FunctionRef(m.secondary.addr, m.secondary.name),
+                    similarity=float(m.similarity),
+                    confidence=float(m.confidence),
+                )
+                for m in mapping
+            ],
+            primary_unmatched=cls._refs(mapping.primary_unmatched),
+            secondary_unmatched=cls._refs(mapping.secondary_unmatched),
+        )
+
+    @staticmethod
+    def _refs(functions: Iterable[QBFunction]) -> list[FunctionRef]:
+        return [FunctionRef(f.addr, f.name) for f in sorted(functions, key=lambda f: f.addr)]
+
+    @property
+    def duration(self) -> float:
+        return sum(seconds for _label, seconds in self.timings)
+
+    @property
+    def timing_report(self) -> str:
+        """Every phase, one per line, longest-running first is *not* wanted —
+        the order they ran in is what makes the total legible."""
+
+        return "\n".join(f"{label}: {format_duration(seconds)}" for label, seconds in self.timings)
+
+    @property
+    def nb_match(self) -> int:
+        return len(self.matches)
+
+    @property
+    def nb_unmatched_primary(self) -> int:
+        return len(self.primary_unmatched)
+
+    @property
+    def nb_unmatched_secondary(self) -> int:
+        return len(self.secondary_unmatched)
+
+
+#: Binary Ninja database extension. Loading one restores the saved analysis,
+#: including renamed functions, types and comments, which is usually what you
+#: want to diff against rather than a fresh auto-analysis of the raw file.
+DATABASE_SUFFIX = ".bndb"
+
+
+def is_database(path: str) -> bool:
+    return path.lower().endswith(DATABASE_SUFFIX)
+
+
+def load_secondary(
+    path: str,
+    progress: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> BinaryView | None:
+    """Load the second side of the diff, from a raw binary or a ``.bndb``.
+
+    Returns ``None`` if cancelled. Deliberately not using ``with load(...)`` —
+    that closes the view on exit, and the diff view holds onto it. The caller
+    owns ``bv.file.close()``.
+    """
+
+    report = progress or (lambda text: None)
+    is_cancelled = cancelled or (lambda: False)
+    name = Path(path).name
+
+    if not Path(path).exists():
+        raise RuntimeError(f"No such file: {path}")
+
+    database = is_database(path)
+    report(f"Opening database {name}" if database else f"Loading {name}")
+
+    def on_progress(current: int, total: int) -> bool:
+        # Only fires for databases. Returning False aborts the load, which is
+        # the one chance to cancel before analysis starts.
+        if total:
+            report(f"Opening database {name} ({current * 100 // total}%)")
+        return not is_cancelled()
+
+    try:
+        bv = binaryninja.load(path, update_analysis=False, progress_func=on_progress)
+    except Exception:
+        # Returning False from the progress callback aborts the load, and
+        # binaryninja.load() surfaces that as a generic failure. Cancelling is
+        # not an error, so do not let it reach the user as one.
+        if is_cancelled():
+            return None
+        raise RuntimeError(
+            f"Binary Ninja could not open {path}"
+            + (
+                " (the database may be from an incompatible version)"
+                if database
+                else " (unrecognized file format)"
+            )
+        ) from None
+
+    if bv is None:
+        if is_cancelled():
+            return None
+        raise RuntimeError(f"Binary Ninja could not open {path}")
+
+    if is_cancelled():
+        return bv
+
+    from .scope import available_regions
+
+    regions = available_regions(bv)
+    if regions and not any(region.loaded for region in regions):
+        # An empty container: analyzing it now costs functions later. Binary
+        # Ninja's initial sweep runs once, over a view that has no code in it
+        # yet, and the segments mapped afterwards get only what recursive
+        # descent reaches from an entry point. Measured on a 26-module SEP
+        # image: 26896 functions analyzing first, 31499 mapping first — the
+        # missing 15% then silently absent from the diff. Whoever loads the
+        # parts (scope, mirror_loaded) leaves the analysis to wait_for_analysis.
+        return bv
+
+    # A database usually arrives fully analyzed, but it may have been saved
+    # mid-analysis, so finish the job either way.
+    report(f"Analyzing {name}")
+    bv.update_analysis_and_wait()
+    return bv
+
+
+#: How often to re-read a view's analysis progress while waiting on it.
+ANALYSIS_POLL_SECONDS = 0.2
+
+
+def wait_for_analysis(
+    bv: BinaryView,
+    progress: Callable[[str, float], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> bool:
+    """Block until ``bv``'s auto-analysis has settled. ``False`` if cancelled.
+
+    The secondary is analyzed as part of loading it, but the primary is the
+    live view the user opened: the diff view can be on screen, and a diff
+    started from it, while Binary Ninja is still disassembling. QBinDiff would
+    then build its program graph from whatever existed at that instant — fewer
+    functions, half-populated basic blocks — and produce a diff that looks
+    plausible, is wrong, and differs from run to run.
+
+    Polling first is what makes the wait cancellable and gives it a progress
+    fraction; ``update_analysis_and_wait`` cannot report either. The final
+    call is still needed, because idle means only that nothing is running
+    right now, not that everything pending has been done.
+    """
+
+    report = progress or (lambda label, fraction: None)
+    is_cancelled = cancelled or (lambda: False)
+    name = Path(bv.file.filename).name
+    label = f"Waiting for analysis of {name}"
+
+    state = bv.analysis_progress
+    while state.state != AnalysisState.IdleState:
+        if is_cancelled():
+            return False
+        report(label, min(state.count / state.total, 1.0) if state.total else 0.0)
+        time.sleep(ANALYSIS_POLL_SECONDS)
+        state = bv.analysis_progress
+
+    if is_cancelled():
+        return False
+    report(f"Analyzing {name}", 0.0)
+    bv.update_analysis_and_wait()
+    return True
+
+
+def build_program(bv: BinaryView, region=None):
+    """Wrap a BinaryView in a QBinDiff ``Program`` via the native backend.
+
+    ``region`` restricts the program to one kext or SEP module; see
+    ``core/scope.py``.
+    """
+
+    from qbindiff.loader import Program
+
+    from .backend import ProgramBackendBinja
+    from .scope import functions_in
+
+    return Program.from_backend(ProgramBackendBinja(bv, functions_in(bv, region)))
+
+
+def run_diff(
+    primary_bv: BinaryView,
+    secondary_bv: BinaryView,
+    options: DiffOptions | None = None,
+    progress: Callable[[str, float], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    region_name: str | None = None,
+) -> DiffResult | None:
+    """Run a full diff. Returns ``None`` if cancelled.
+
+    ``progress`` receives a label and a 0..1 fraction. ``cancelled`` is polled
+    between iterations; both generators below are ordinary Python generators,
+    so abandoning them is safe.
+    """
+
+    import numpy
+
+    from qbindiff import Distance, QBinDiff
+    from qbindiff.features import DEFAULT_FEATURES, FEATURES
+
+    options = options or DiffOptions()
+    is_cancelled = cancelled or (lambda: False)
+    report = progress or (lambda label, frac: None)
+    timings: list[tuple[str, float]] = []
+
+    with _log_bridge():
+        # Scoping happens before anything else: loading a kext changes the
+        # function list, and waiting for analysis on a view that has not been
+        # given its code yet would wait for nothing.
+        primary_region = secondary_region = None
+        if region_name is not None:
+            from .scope import ensure_loaded, find_region
+
+            for label, view in (("primary", primary_bv), ("secondary", secondary_bv)):
+                region = find_region(view, region_name)
+                if region is None:
+                    from .scope import missing_region_hint
+
+                    raise RuntimeError(
+                        f"The {label} binary has no part named {region_name!r}."
+                        f"{missing_region_hint(view)}"
+                    )
+                report(f"Loading {region_name}", INDETERMINATE)
+                if not ensure_loaded(view, region):
+                    raise RuntimeError(f"Could not load {region_name!r} from the {label} binary.")
+                if label == "primary":
+                    primary_region = find_region(view, region_name)
+                else:
+                    secondary_region = find_region(view, region_name)
+            log_info(f"Diffing only {region_name}", "QBinDiff")
+
+        else:
+            # A container holds no code until something is mapped into it, so
+            # an unscoped diff has to mirror the primary's parts across first.
+            from .scope import mirror_loaded
+
+            mirrored = mirror_loaded(
+                primary_bv,
+                secondary_bv,
+                progress=lambda name: report(f"Loading {name}", INDETERMINATE),
+            )
+            if mirrored:
+                log_info(f"Diffing {len(mirrored)} part(s): {', '.join(mirrored)}", "QBinDiff")
+
+        # Before the function counts below mean anything: a view still being
+        # analyzed can legitimately have none yet.
+        with _timed(timings, "Waiting for analysis"):
+            for view in (primary_bv, secondary_bv):
+                if not wait_for_analysis(view, progress=report, cancelled=is_cancelled):
+                    return None
+
+        # A file Binary Ninja does not recognize still opens, as a raw view
+        # with no functions. Diffing that yields an empty result that looks
+        # like a plugin bug, so say what actually happened.
+        for label, view in (("primary", primary_bv), ("secondary", secondary_bv)):
+            if len(view.functions) == 0:
+                raise RuntimeError(
+                    f"The {label} binary ({view.file.filename}) contains no functions. "
+                    f"Binary Ninja may not recognize its format, or analysis may not "
+                    f"have run."
+                )
+
+        options = scale_options_for_size(
+            options, len(primary_bv.functions), len(secondary_bv.functions)
+        )
+
+        report("Building program graphs", 0.0)
+        with _timed(timings, "Building the primary graph"):
+            primary = build_program(primary_bv, primary_region)
+        if is_cancelled():
+            return None
+        with _timed(timings, "Building the secondary graph"):
+            secondary = build_program(secondary_bv, secondary_region)
+        if is_cancelled():
+            return None
+
+        log_info(
+            f"Diffing {len(primary)} vs {len(secondary)} functions",
+            "QBinDiff",
+        )
+
+        differ = QBinDiff(
+            primary,
+            secondary,
+            distance=Distance[options.distance],
+            normalize=options.normalize,
+            sparsity_ratio=options.sparsity_ratio,
+            tradeoff=options.tradeoff,
+            epsilon=options.epsilon,
+            maxiter=options.maxiter,
+            sparse_row=options.sparse_row,
+        )
+        differ.register_postpass(match_named_functions)
+
+        extractors = {f.key: f for f in FEATURES}
+        selected = list(DEFAULT_FEATURES)
+        for key in (*DEFAULT_EXTRA_FEATURES, *options.features):
+            extractor = extractors.get(key)
+            if extractor is None:
+                log_warn(f"Unknown feature '{key}' ignored", "QBinDiff")
+            elif extractor not in selected:
+                selected.append(extractor)
+        for extractor in selected:
+            differ.register_feature_extractor(extractor, 1.0)
+
+        # Phase 1 yields absolute values in [0, 1000], possibly more than 1000
+        # times; phase 2 yields the iteration number and may converge early.
+        # Both stop reporting well before they stop working — see the labels
+        # below, which are set *before* each silent stretch begins.
+        phase = ""
+        with _timed(timings, "Extracting features"):
+            for step in differ.process_iterator():
+                if is_cancelled():
+                    return None
+                label, value = feature_phase(min(step / 1000.0, 1.0))
+                if label != phase:
+                    phase = label
+                    if value is INDETERMINATE:
+                        log_info(
+                            f"Feature extraction done; building the similarity matrix for "
+                            f"{len(selected)} features over {len(primary)} x "
+                            f"{len(secondary)} functions. Nothing reports progress until "
+                            f"that finishes, and it is usually the longest part of the run.",
+                            "QBinDiff",
+                        )
+                report(label, value)
+
+        # matching_iterator sparsifies the similarity matrix and computes the
+        # squares matrix before its first yield; on a large pair that argsort
+        # alone runs for minutes.
+        report("Preparing the matcher", INDETERMINATE)
+        iterations = 0
+        # Belief propagation raises e to the marginals, which overflows to +inf
+        # by design — qbindiff clips the result to 1e6 on the next line, since
+        # any probability past 99.9999% is the same answer, and the clipped
+        # value is identical either way. numpy still reports every one as a
+        # RuntimeWarning, once per iteration, into a log being read for real
+        # problems. errstate is thread-local, so this silences overflow for the
+        # diff thread only and nothing else in Binary Ninja is affected.
+        with _timed(timings, "Matching functions"), numpy.errstate(over="ignore"):
+            for iteration in differ.matching_iterator():
+                if is_cancelled():
+                    return None
+                iterations = iteration
+                report("Matching functions", min(iteration / max(differ.maxiter, 1), 1.0))
+        # Belief propagation usually converges long before maxiter, so the
+        # iteration count is what makes its duration interpretable.
+        log_info(
+            f"Belief propagation converged after {iterations} of at most "
+            f"{differ.maxiter} iterations",
+            "QBinDiff",
+        )
+
+        report("Scoring matches", 1.0)
+        with _timed(timings, "Scoring matches"):
+            mapping = differ.mapping
+        if mapping is None:
+            return None
+        result = DiffResult.build(primary_bv, secondary_bv, mapping)
+        result.timings = timings
+        return result
+
+
+class SecondaryTask(BackgroundTaskThread):
+    """Shared plumbing for tasks that bring up a secondary binary.
+
+    Both producing a diff and restoring a saved one open the second side and
+    report the same way, and both must release that view again on every path
+    that never hands it to the UI. Subclasses implement ``run``.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        primary_bv: BinaryView,
+        secondary: BinaryView | str,
+        on_done: Callable[[DiffResult], None],
+        on_error: Callable[[str], None],
+        on_progress: Callable[[str, float], None] | None = None,
+        on_cancelled: Callable[[], None] | None = None,
+    ):
+        super().__init__(title, can_cancel=True)
+        self.primary_bv = primary_bv
+        self._secondary = secondary
+        self._on_done = on_done
+        self._on_error = on_error
+        self._on_progress = on_progress
+        self._on_cancelled = on_cancelled
+        #: Set when this task loaded the secondary itself and therefore owns it.
+        self.owns_secondary = isinstance(secondary, str)
+        #: Timed here rather than in run_diff, which never sees the load.
+        self.load_timings: list[tuple[str, float]] = []
+
+    def _report(self, label: str, fraction: float) -> None:
+        if fraction < 0:
+            self.progress = f"Binary diff: {label}"
+        else:
+            self.progress = f"Binary diff: {label} ({fraction * 100:.0f}%)"
+        if self._on_progress is not None:
+            self._on_progress(label, fraction)
+
+    def _report_text(self, label: str) -> None:
+        """Progress for phases with no meaningful fraction, such as loading."""
+
+        self.progress = f"Binary diff: {label}"
+        if self._on_progress is not None:
+            self._on_progress(label, 0.0)
+
+    def _open_secondary(self) -> BinaryView | None:
+        if isinstance(self._secondary, str):
+            with _timed(self.load_timings, "Loading and analyzing the secondary binary"):
+                return load_secondary(
+                    self._secondary,
+                    progress=self._report_text,
+                    cancelled=lambda: self.cancelled,
+                )
+        return self._secondary
+
+    def _cancel(self, secondary_bv: BinaryView | None) -> None:
+        log_info("Diff cancelled", "QBinDiff")
+        self._discard(secondary_bv)
+        if self._on_cancelled is not None:
+            self._on_cancelled()
+
+    def _fail(self, secondary_bv: BinaryView | None, exc: Exception) -> None:
+        log_error(traceback.format_exc(), "QBinDiff")
+        self._discard(secondary_bv)
+        self._on_error(str(exc))
+
+    def _discard(self, secondary_bv: BinaryView | None) -> None:
+        """Close a secondary we loaded but will never hand to the UI."""
+
+        if secondary_bv is None or not self.owns_secondary:
+            return
+        try:
+            secondary_bv.file.close()
+        except Exception:
+            log_warn("Failed to close the secondary binary", "QBinDiff")
+
+
+class DiffTask(SecondaryTask):
+    """Background task that optionally loads a secondary binary, then diffs."""
+
+    def __init__(
+        self,
+        primary_bv: BinaryView,
+        secondary: BinaryView | str,
+        on_done: Callable[[DiffResult], None],
+        on_error: Callable[[str], None],
+        options: DiffOptions | None = None,
+        on_progress: Callable[[str, float], None] | None = None,
+        on_cancelled: Callable[[], None] | None = None,
+        region_name: str | None = None,
+    ):
+        super().__init__(
+            "Binary diff: starting",
+            primary_bv,
+            secondary,
+            on_done,
+            on_error,
+            on_progress=on_progress,
+            on_cancelled=on_cancelled,
+        )
+        self._options = options or DiffOptions()
+        #: Diff only this kext / SEP module, by name. See core/scope.py.
+        self._region_name = region_name
+
+    def run(self) -> None:
+        secondary_bv: BinaryView | None = None
+        try:
+            secondary_bv = self._open_secondary()
+
+            result = None
+            if secondary_bv is not None and not self.cancelled:
+                result = run_diff(
+                    self.primary_bv,
+                    secondary_bv,
+                    options=self._options,
+                    progress=self._report,
+                    cancelled=lambda: self.cancelled,
+                    region_name=self._region_name,
+                )
+
+            if result is None:
+                self._cancel(secondary_bv)
+                return
+
+            result.timings[:0] = self.load_timings
+            log_info(
+                f"Diff complete in {format_duration(result.duration)}: "
+                f"{result.nb_match} matches, similarity {result.similarity:.3f}",
+                "QBinDiff",
+            )
+            self._on_done(result)
+        except Exception as exc:
+            self._fail(secondary_bv, exc)

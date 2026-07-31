@@ -1,0 +1,50 @@
+# Ruff configuration. Kept as a standalone file because the plugin is not a
+# packaged project and has no pyproject.toml.
+
+line-length = 100
+target-version = "py310"
+
+# The vendored trees are read-only upstream checkouts, not our code. Linting
+# them produces thousands of findings nobody will act on, and formatting them
+# would make every future diff against upstream unreadable.
+extend-exclude = [
+    "qbindiff",
+    "quokka",
+    "binaryninja-api",
+    "sep-binja",
+    # Ruff formats Python fenced in Markdown. The README's snippets are lines to
+    # paste into Binary Ninja's console, not source: "import sys; sys.version"
+    # is one command on purpose.
+    "*.md",
+]
+
+[lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "C4",  # comprehensions
+    "RUF",
+]
+
+# Deliberately NOT enabling "I" (isort). Every module under ui/ imports
+# binaryninjaui before PySide6, because Binary Ninja ships a custom PySide6
+# build ABI-matched to its own libbinaryninjaui; loading them the other way
+# round takes the process down rather than raising. Alphabetical order puts
+# PySide6 first, so an import sorter turns a working plugin into a crash.
+ignore = [
+    "E501",  # line length is enforced by the formatter, which respects strings
+]
+
+[lint.per-file-ignores]
+# QAbstractTableModel's overrides take `parent=QModelIndex()`, matching the C++
+# signature Qt calls them through. B008 is right about mutable defaults in
+# general and wrong about this one.
+"ui/matchtable.py" = ["B008"]
+
+[format]
+# Deliberately leaving docstring-code-format off. Several module docstrings
+# open with the command that runs them, indented; the formatter reads those as
+# code blocks and dedents them into the prose.
