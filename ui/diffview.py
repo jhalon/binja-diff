@@ -10,14 +10,17 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 from dataclasses import replace
+from functools import partial
 
 import binaryninjaui  # must precede PySide6; see ui/__init__
 from binaryninja import execute_on_main_thread, log_error
 from binaryninjaui import UIActionHandler, View, ViewType
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -54,6 +57,63 @@ _SAVED_DIFF_FILTER = f"Saved diffs (*{persist.FILE_SUFFIX} *.json);;All files (*
 _RESTORE_ACTION = "binjaDiffRestoreAction"
 
 
+#: Secondary views the plugin has opened and not yet closed. Binary Ninja holds
+#: a lock on an open database, and a plugin that never closes one leaves that
+#: lock behind: the file cannot be reopened even after Binary Ninja exits.
+#: QWidget.destroyed covers a tab being closed, but not the process going away
+#: — Qt tears the application down without destroying every widget — so the
+#: views are tracked here and closed from the two shutdown hooks below.
+_OPEN_SECONDARIES: set = set()
+
+
+def _close_secondary(bv) -> None:
+    """Close one view and forget it. Closing is what releases a `.bndb` lock."""
+
+    if bv is None:
+        return
+    _OPEN_SECONDARIES.discard(bv)
+    try:
+        bv.file.close()
+    except Exception:
+        pass
+
+
+def _release_holder(holder: dict, *_args) -> None:
+    """Close whatever a view was holding, given only its holder.
+
+    Deliberately takes a plain dict rather than the DiffView: this is what runs
+    on ``QWidget.destroyed``, and a bound method of the widget being destroyed
+    is exactly what PySide may never call — the Python wrapper is invalidated
+    as the C++ object goes away. Nothing here touches the widget.
+    """
+
+    _close_secondary(holder.get("bv"))
+    holder["bv"] = None
+
+
+def _close_open_secondaries() -> None:
+    for bv in list(_OPEN_SECONDARIES):
+        _close_secondary(bv)
+    _OPEN_SECONDARIES.clear()
+
+
+def _install_shutdown_hooks() -> None:
+    """Close what we hold when the process ends, however it ends.
+
+    Both hooks, because neither is guaranteed: aboutToQuit does not fire if the
+    interpreter is torn down without the Qt event loop stopping cleanly, and
+    atexit does not fire if the host exits through Qt alone.
+    """
+
+    atexit.register(_close_open_secondaries)
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(_close_open_secondaries)
+
+
+_install_shutdown_hooks()
+
+
 class DiffView(QWidget, View):
     """Side-by-side binary diff, selectable from the view dropdown."""
 
@@ -85,8 +145,11 @@ class DiffView(QWidget, View):
         self.actionHandler.setupActionHandler(self)
 
         self.setAcceptDrops(True)
+        #: What this view has open, reachable without the widget. See
+        #: _release_holder for why the destroyed handler must not touch self.
+        self._owned: dict = {"bv": None}
         # shiboken objects never see __del__, so release the secondary here.
-        self.destroyed.connect(self._release_secondary)
+        self.destroyed.connect(partial(_release_holder, self._owned))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -135,6 +198,16 @@ class DiffView(QWidget, View):
         self.open_button = QPushButton("Open secondary...", self)
         self.open_button.clicked.connect(self.dropzone_browse)
         header.addWidget(self.open_button)
+
+        self.close_button = QPushButton("Close secondary", self)
+        self.close_button.setEnabled(False)
+        self.close_button.setToolTip(
+            "Discard the diff and release the second binary. Binary Ninja locks an "
+            "open database, so a .bndb diffed here cannot be opened elsewhere until "
+            "this releases it."
+        )
+        self.close_button.clicked.connect(self.close_secondary)
+        header.addWidget(self.close_button)
 
         self.save_button = QPushButton("Save diff", self)
         self.save_button.setEnabled(False)
@@ -311,6 +384,9 @@ class DiffView(QWidget, View):
         self._finish_task()
         self.result = result
         self.secondary_bv = result.secondary_bv
+        if self._owns_secondary:
+            _OPEN_SECONDARIES.add(result.secondary_bv)
+            self._owned["bv"] = result.secondary_bv
         self.secondary_label.setText(f"Secondary: {result.secondary_bv.file.filename}")
         self.status.setText(
             f"{note}similarity {result.similarity:.3f} in {format_duration(result.duration)}"
@@ -319,6 +395,7 @@ class DiffView(QWidget, View):
         # and the same lines are in the log for anyone who wants to keep them.
         self.status.setToolTip(result.timing_report)
         self.save_button.setEnabled(True)
+        self.close_button.setEnabled(self._owns_secondary)
 
         self.graph_tab.set_views(result.primary_bv, result.secondary_bv)
         self.table.set_result(result)
@@ -328,6 +405,7 @@ class DiffView(QWidget, View):
         self.result = None
         self._selected_row = None
         self.save_button.setEnabled(False)
+        self.close_button.setEnabled(False)
         self.table.set_result(None)
         self.graph_tab.clear()
         for tab in self.text_tabs.values():
@@ -335,6 +413,12 @@ class DiffView(QWidget, View):
 
     def _reset_to_dropzone(self, status: str) -> None:
         self._finish_task()
+        # The task closed whatever it had opened; drop the reference with the
+        # ownership flag, or _release_secondary would later close it twice.
+        if self.secondary_bv is not None and self._owns_secondary:
+            _OPEN_SECONDARIES.discard(self.secondary_bv)
+        self._owned["bv"] = None
+        self.secondary_bv = None
         self._owns_secondary = False
         self.status.setText(status)
         self.status.setToolTip("")
@@ -351,17 +435,38 @@ class DiffView(QWidget, View):
         QMessageBox.critical(self, "Binary diff failed", message)
 
     def _release_secondary(self) -> None:
-        """Close a BinaryView we loaded ourselves; the UI owns the others."""
+        """Close a BinaryView we loaded ourselves; the UI owns the others.
+
+        Closing it is what releases Binary Ninja's lock on a `.bndb`, so this
+        has to happen whenever the plugin stops needing the view — not only
+        when someone gets round to destroying the widget.
+        """
 
         if self.secondary_bv is not None and self._owns_secondary:
-            try:
-                self.secondary_bv.file.close()
-            except Exception:
-                pass
+            _close_secondary(self.secondary_bv)
+        self._owned["bv"] = None
         self.secondary_bv = None
         self._owns_secondary = False
 
     # -- porting symbols ---------------------------------------------------
+
+    def close_secondary(self) -> None:
+        """Release the second binary, and with it any lock on its database.
+
+        The diff goes with it: every pane points at that view. Worth having as
+        its own action because the alternative is closing the whole tab, and a
+        `.bndb` held open here cannot be opened anywhere else.
+        """
+
+        if self._task is not None or self.secondary_bv is None:
+            return
+        name = os.path.basename(self.secondary_bv.file.filename or "")
+        self._release_secondary()
+        self._clear_results()
+        self.secondary_label.setText("Secondary: none")
+        self.status.setText(f"released {name}" if name else "secondary released")
+        self.status.setToolTip("")
+        self.stack.setCurrentIndex(_PAGE_DROP)
 
     def _show_match_menu(self, position) -> None:
         """Offer to carry the selected names across, in either direction."""

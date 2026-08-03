@@ -149,6 +149,25 @@ do not reliably see `__del__`, so the secondary `BinaryView` is released from a
 `destroyed` handler in `ui/diffview.py`. Only close a `BinaryView` the plugin
 loaded itself; the ones the UI owns must be left alone.
 
+**Closing that view is what releases the lock on a `.bndb`**, and three things
+have to line up or the user cannot reopen their own database:
+
+- The `destroyed` handler must not be a **bound method of the widget being
+  destroyed**. PySide invalidates the Python wrapper as the C++ object goes
+  away, so such a slot can simply never run — which is how a diffed `.bndb`
+  stayed locked for a whole session. `_release_holder` takes a plain dict
+  (`DiffView._owned`) holding the view, and touches nothing else.
+- `destroyed` does not fire at all when the host process exits: Qt tears the
+  application down without destroying every widget. `_OPEN_SECONDARIES` tracks
+  what the plugin has open and is drained from both `atexit` and
+  `QApplication.aboutToQuit`, since neither hook fires in every shutdown path.
+- Anything that drops the reference — `_reset_to_dropzone` after a cancelled or
+  failed run — must clear `_owned` too, or the registry closes a view the task
+  already closed.
+
+`close_secondary()` exists so the lock can be released without closing the tab;
+the diff goes with it, because every pane points at that view.
+
 **`binaryninja.load()` must not be used as a context manager here.** The `with`
 form closes the view on exit, and the diff view holds the secondary view for
 its whole lifetime.
