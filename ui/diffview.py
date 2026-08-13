@@ -401,7 +401,13 @@ class DiffView(QWidget, View):
         self.table.set_result(result)
         self.stack.setCurrentIndex(_PAGE_RESULTS)
 
+        from ..core.registry import register
+        register(result)
+
     def _clear_results(self) -> None:
+        if self.result is not None and self.data is not None:
+            from ..core.registry import unregister
+            unregister(self.data.file.filename)
         self.result = None
         self._selected_row = None
         self.save_button.setEnabled(False)
@@ -587,6 +593,9 @@ class DiffView(QWidget, View):
         # renamed side are now stale.
         symbols.refresh_names(self.result)
         self.table.set_result(self.result)
+
+        from ..core.registry import register
+        register(self.result)
 
     def _on_port_failed(self, message: str) -> None:
         self._port_task = None
